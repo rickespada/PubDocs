@@ -2,10 +2,12 @@
 
 > Mirrored from the private `CPMS` source repo's own `QUICKSTART.md`
 > (linked from the appliance's Web UI) - manually synced, not automated,
-> so it can lag the source after an edit there. One deliberate difference
+> so it can lag the source after an edit there. Two deliberate differences
 > from the source: the exact default-credential pattern for an
 > unconfigured clone is redacted here and only ever shown live, post-login,
-> on the appliance itself (its login banner) - not published publicly.
+> on the appliance itself (its login banner) - not published publicly; and
+> lab-specific addresses in the source's own examples are replaced with
+> generic placeholders below.
 
 Build one golden image, seal it, and clone it into as many measurement
 endpoints and controllers as you need. Every clone boots to a console menu,
@@ -80,12 +82,69 @@ One NIC is the shipped default; dual-NIC is fully supported for operators
 who need management isolation, just not what an unconfigured appliance
 assumes (spec §2.1).
 
+### Get the repo onto the VM
+
+Two ways to land a full checkout at `~/cpms` on the master, both verified
+working 2026-09-03. Everything below — the install loop included —
+assumes you're running it from inside that directory.
+
+**Zip download (no git, no SSH keys ever touch the VM)** — the repo is
+private, so this needs a browser session already authenticated to
+GitHub; there is no way to `curl`/`wget` it without a token.
+
+1. On github.com: **Code → Download ZIP**.
+2. `scp`/WinSCP the zip to the VM, e.g. to `/tmp/CPMS-main.zip`.
+3. On the VM:
+   ```bash
+   sudo apt install unzip
+   cd /tmp && unzip CPMS-main.zip
+   mv CPMS-main ~/cpms
+   find ~/cpms -maxdepth 1 -name '*.sh' ! -perm -u+x -exec chmod +x {} \;
+   cd ~/cpms
+   ```
+   GitHub's export nests the repo one level down in a `<repo>-<branch>`
+   folder (`CPMS-main` for a zip of `main`) — the `mv` un-nests it to the
+   plain `~/cpms` every other step in this document assumes. The zip also
+   never preserves the executable bit on anything, so the `find`/`chmod`
+   sweep is required every time, not only when copying from Windows.
+4. **Verify before trusting it.** Compare checksums against your own
+   working copy for a handful of representative files — at least one
+   script, one SQL/JSON asset, and `CLAUDE.md`:
+   ```bash
+   # locally
+   md5sum cpms-provision.sh cpms-setup.sh sql/schema.sql catalog/catalog.json CLAUDE.md
+   # on the VM
+   cd ~/cpms && md5sum cpms-provision.sh cpms-setup.sh sql/schema.sql catalog/catalog.json CLAUDE.md
+   ```
+   and confirm the chmod sweep caught everything:
+   ```bash
+   find ~/cpms -maxdepth 1 -name '*.sh' ! -perm -u+x
+   ```
+   Expect identical checksums and no output at all from the `find` (every
+   `.sh` file already executable).
+
+This method also happens to be strictly cleaner than a `git clone` would
+be here: it never creates a `.git` directory at all, so there's no
+temptation to `git pull`/`git status` a checkout on a machine this
+project deliberately never syncs that way — `~/cpms` on a running
+appliance is `scp`-only by design (see `CLAUDE.md`), and the zip method
+starts that same way from the first byte.
+
+**Direct `scp`/WinSCP of the working tree** works too, and is the same
+method used to push individual file updates to an already-provisioned
+VM later — but from Windows it silently drops the executable bit on
+every `.sh` file it transfers (Windows has no POSIX execute-bit concept
+for `scp`/WinSCP to send; content matches byte-for-byte, only the mode is
+wrong). Run the same `find ... -exec chmod +x` sweep above afterward
+regardless of which transfer method you used.
+
 ### Scripts
 
-Copy the repo to the **master** VM, then install everything on it — all of
-it, regardless of role. A clone's role is chosen later, at first boot, and
-can change again after that, so the master needs every script no matter
-which role a given clone ends up as (spec §3 has the full reasoning).
+Install everything on the master — all of it, regardless of role. A
+clone's role is chosen later, at first boot, and can change again after
+that, so the master needs every script no matter which role a given
+clone ends up as (spec §3 has the full reasoning). Run this from inside
+`~/cpms`:
 
 ```bash
 for f in cpms-netrollback cpms-pathmtu cpms-quiesce cpms-toolset \
@@ -101,9 +160,6 @@ sudo install -m 0755 cpms_mcp.py    /usr/local/bin/cpms_mcp.py
 > executable bit. The `install` commands above are unaffected — they set
 > the mode on the destination.
 
-*Planned improvement:* package this as a single tarball instead of copying
-the repo file-by-file. Not built yet.
-
 ### Initialize
 
 Toolset first, then provision — that's the dependency order. Both are
@@ -113,7 +169,7 @@ the VM console or inside tmux — a dropped SSH session mid-apt leaves a
 dpkg lock to clean up.
 
 ```bash
-sudo cpms-toolset install safe
+sudo cpms-toolset install
 tmux new -s prov 'sudo cpms-provision --role endpoint 2>&1 | tee /tmp/prov.log'
 ```
 
@@ -123,24 +179,25 @@ source build so every clone inherits the binary, and a controller clone
 converges away the rest once configured (see §05 below; spec §3 has the
 full reasoning).
 
-#### The ten stages
+#### The eleven stages
 
 | # | Stage | `endpoint` | `controller` |
 |---|---|---|---|
 | 1 | Base packages | measurement set | core, app, firewall + container runtime |
 | 2 | Quiesce background activity | full | package timers only, never its own services |
 | 3 | iperf3 source build | yes | skipped |
-| 4 | Sysctl + perfprofile | yes | baseline sysctl only |
+| 4 | Sysctl + cpms-perfprofile | yes | baseline sysctl only |
 | 5 | tmpfs ramdisk | yes | removed if present |
 | 6 | iperf3 listener | enabled | disabled |
-| 7 | perfenv fingerprint | yes | yes |
+| 7 | cpms-perfenv fingerprint | yes | yes |
 | 8 | First-boot service | yes | yes |
 | 9 | Orchestration hookup | scoped NOPASSWD sudo rule | key directory |
-| 10 | Validation | measurement checks | controller checks |
+| 10 | OWAMP/TWAMP source build | enabled (ports 861/862) | disabled |
+| 11 | Validation | measurement checks | controller checks |
 
 Stage 9 is what lets a controller drive an endpoint later. On an endpoint
 it installs `/etc/sudoers.d/cpms-endpoint` so `perfadmin` can run
-`cpms-bench`, `cpms-quiesce` and `perfenv` as root without a password —
+`cpms-bench`, `cpms-quiesce` and `cpms-perfenv` as root without a password —
 nothing else. Skip it and controller-driven runs hang on a password
 prompt with no terminal to answer it, which looks exactly like a network
 fault.
@@ -151,7 +208,12 @@ fault.
   download warning here is the one failure worth stopping for — the
   provenance argument (spec §1) rests on the pinned version.
 - **Stage 6** should name your real interface, not a guessed one.
-- **Stage 10** is the verdict. Any `FAILED` line goes into every clone.
+- **Stage 10** clones and builds OWAMP/TWAMP from GitHub — this is the one
+  stage that depends on external network reachability, and it fails soft
+  (a `[!]` warning, not a `FAILED`) if `github.com` isn't reachable from
+  this VM. Re-run `--stage 10` once it is, or clone manually per
+  `CLAUDE.md`'s recipe and re-run.
+- **Stage 11** is the verdict. Any `FAILED` line goes into every clone.
 
 ```bash
 grep -nE '\[!\]|\[x\]|FAILED|could not' /tmp/prov.log
@@ -161,6 +223,60 @@ ss -lnt | grep 5201
 
 Expect: no grep output, `iperf 3.21`, and a `LISTEN` on the interface
 address — **not** `0.0.0.0`.
+
+#### Cache the controller MCP venv
+
+One more thing worth front-loading onto the master before sealing, same
+reasoning as stage 3's iperf3 build: `cpms_mcp.py`'s Python venv
+(`/opt/cpms-mcp`, `mcp` + `psycopg2-binary` from PyPI) is normally only
+built the first time a clone is actually provisioned as `--role
+controller` — which means depending on PyPI being reachable from
+whatever network that specific clone eventually lives on, and a few
+seconds of setup work every time a fresh controller is stood up. Caching
+it now, once, while this master already has confirmed internet access,
+means every future controller clone skips straight to starting
+`cpms-mcp.service` with no extra step and no PyPI dependency later.
+
+```bash
+sudo cpms-provision --build-mcp-venv
+```
+
+This is deliberately **not** the same as running stage 9 with `--role
+controller` — that would also generate a real MCP bearer token and start
+`cpms-mcp.service` listening on `0.0.0.0:8765` on what is still, right
+now, an endpoint-role master, baking a live credentialed listener into
+every clone including future endpoints. `--build-mcp-venv` does only the
+venv, nothing else, and is safe on a master regardless of what role it
+currently is or will become.
+
+#### Cache the datastore's docker images (air-gapped controllers)
+
+Same reasoning again, one layer up the stack: `docker/compose.yaml`'s
+postgres/grafana images and the locally-built backend/frontend are
+normally pulled and built the first time a clone is provisioned as
+`--role controller` — which means every controller needs registry access
+at the moment it's stood up. If that controller is going somewhere
+air-gapped, front-load it here instead, while this master still has
+confirmed internet access:
+
+```bash
+sudo cpms-provision --stage-datastore-images
+```
+
+`cpms-seal` never touches `/var/lib/docker`, so whatever gets cached here
+survives sealing and cloning intact — a controller clone finds every
+image already there and starts the archive with no registry access at
+all. Same shape as `--build-mcp-venv`: no role resolution, no credentials
+generated, no containers started — just the images. A real *endpoint*
+clone does not inherit a running daemon from this either; role
+convergence stops and disables docker on an endpoint (stage 9), so
+pre-staging images on the master never leaves a bridge or iptables rules
+on a host that's supposed to have a clean measurement path.
+
+Already deployed a controller without this and need it air-gapped later?
+`sudo cpms-datastore pull` does the same pull+build on a live controller
+— then move the images to the air-gapped host with `docker save` /
+`docker load`.
 
 #### Smoke test before you commit
 
@@ -244,7 +360,14 @@ role once the rest of the picture is staged (§10.8).
 
 ### Controller
 
-1. **1 · Interface addresses** — static, on the management VLAN
+1. **1 · Interface addresses** — DHCP is the default here, deliberately, and
+   fine to keep: unlike the test interface (where DHCP is discouraged —
+   spec §2.1, addresses there must be predictable and stable),
+   `CPMS_MGMT_MODE` defaults to `dhcp` in the code itself, and
+   `gen_chrony_conf()`'s own `allow all` (rather than deriving the
+   management subnet) is written specifically to tolerate this address
+   changing later. Pick `static` only if this management network doesn't
+   already hand out stable/reserved leases.
 2. **3 · MTU** — 1500; jumbo here only risks the path it drives endpoints over
 3. **6 · Hostname** — unique per clone
 4. **7 · Appliance role** — `controller`; it warns that the listener gets
@@ -320,9 +443,15 @@ and applies the schema:
 sudo cpms-datastore init
 ```
 
-It prints the Grafana URL and a generated admin password. **That file is the
-only copy** — `/etc/cpms/datastore.env`, mode 0600, not in git, and removed
-by `cpms-seal` so every clone generates its own.
+It prints the Grafana URL and a generated admin password — the only time
+it's shown in full. **That file is the only copy** —
+`/etc/cpms/datastore.env`, mode 0600, not in git, and removed by
+`cpms-seal` so every clone generates its own. Lost the password, or
+missed it scrolling past? Read it back any time:
+
+```bash
+sudo grep GRAFANA_ADMIN_PASSWORD /etc/cpms/datastore.env
+```
 
 ```bash
 sudo cpms-datastore status
@@ -347,9 +476,12 @@ the usual way: set `PGHOST`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`, or pass
 `cpms-ingest` **refuses a result with no `cpms_env`** — see §06 for why the
 merge step is not optional.
 
-> Going air-gapped? Run `sudo cpms-datastore pull` first, then move the
-> images with `docker save` / `docker load`. There is no registry access
-> once the controller is isolated.
+> Going air-gapped? Best done on the master before sealing —
+> `sudo cpms-provision --stage-datastore-images`, §"Build the Master"
+> above — so every clone needs no registry access at all. Already live
+> and need to catch up? `sudo cpms-datastore pull` does the same
+> pull+build on this controller; move the images to the air-gapped host
+> with `docker save` / `docker load`.
 
 ---
 
@@ -360,22 +492,23 @@ measures** — it holds the key, decides what runs where, pushes the command
 to an endpoint, and files the result. The traffic is generated entirely on
 the endpoint (§2.2, §10.10).
 
-Do this once per endpoint, from the controller.
+The controller's own SSH key (`/etc/cpms/id_cpms`, root-only, no
+passphrase — the controller runs unattended, and a passphrase stored
+beside the key protects nothing) is already created by the time you
+reach this step — `cpms-provision --role controller` creates it itself,
+and safely no-ops on a re-provision rather than regenerating it (which
+would orphan every endpoint already enrolled). No separate `keygen` step
+needed.
 
 ```bash
-sudo cpms-orchestrate keygen
+sudo cpms-orchestrate enroll <endpoint-1-address> <endpoint-2-address>
 ```
 
-Creates `/etc/cpms/id_cpms`, root-only, no passphrase — the controller runs
-unattended, and a passphrase stored beside the key protects nothing. Run it
-once. Regenerating orphans every endpoint already enrolled.
-
-```bash
-sudo cpms-orchestrate enroll 192.168.65.146
-```
-
-`ssh-copy-id` asks for the `perfadmin` password **once**. That is the only
-time a password is needed. Enrol then does three things worth knowing:
+Takes one address or several in a single call — enrol the whole fleet at
+once instead of one command per endpoint. `ssh-copy-id` asks for the
+`perfadmin` password **once per new host**; already-enrolled hosts in the
+same call are skipped straight to re-verification. Enrol then does three
+things worth knowing, per host:
 
 - **Verifies before recording.** The host is only written to the registry
   after a key login actually succeeds and returns its hostname. A row that
@@ -387,7 +520,11 @@ time a password is needed. Enrol then does three things worth knowing:
 - **Enrols a controller as `target-only`.** A controller is a legitimate
   thing to measure *against* and must never be scheduled as a source.
 
-Repeat for each endpoint, then confirm the fleet:
+One host failing (unreachable, bad password) does not stop the rest of
+the batch — each is attempted independently, and the command's own exit
+status reflects whether *all* of them succeeded.
+
+Confirm the fleet:
 
 ```bash
 sudo cpms-orchestrate check
@@ -399,7 +536,7 @@ sudo cpms-orchestrate check
   [!] cpms-endpoint03        reachable, missing: cpms-bench
 ```
 
-`ready` means reachable **and** carrying `cpms-bench`, `perfenv` and
+`ready` means reachable **and** carrying `cpms-bench`, `cpms-perfenv` and
 `iperf3`. Fix a `missing:` line before scheduling anything against it.
 
 ### Running a test from the controller
@@ -407,13 +544,13 @@ sudo cpms-orchestrate check
 Dry run first — it prints the plan, takes no lock and touches no host:
 
 ```bash
-sudo cpms-orchestrate run --source cpms-endpoint01 --target 192.168.65.252 --matrix quick --dry-run
+sudo cpms-orchestrate run --source cpms-endpoint01 --target <peer-address> --matrix quick --dry-run
 ```
 
 Then for real:
 
 ```bash
-sudo cpms-orchestrate run --source cpms-endpoint01 --target 192.168.65.252 --matrix baseline
+sudo cpms-orchestrate run --source cpms-endpoint01 --target <peer-address> --matrix baseline
 ```
 
 The endpoint's output streams back live. When it finishes, results are
@@ -421,6 +558,19 @@ fetched to `/var/lib/cpms/incoming/<timestamp>/` and ingested automatically.
 
 **`--source` must be an enrolled endpoint.** Anything else is refused rather
 than quietly run on the controller.
+
+**`storage` is the one matrix with no `--target`** — it measures a
+local disk or an already-mounted NFS/SMB/iSCSI path on the source itself,
+not a peer:
+
+```bash
+sudo cpms-orchestrate run --source cpms-endpoint01 --matrix storage \
+     --storage-path /mnt/data --storage-profile file_general
+```
+
+`cpms-bench` mounts nothing for you — `--storage-path` must already be a
+writable, mounted directory. See [TOOLS.md](TOOLS.md) for the other five
+workload profiles and what each models.
 
 ### The global lock
 
@@ -439,6 +589,26 @@ sudo cpms-orchestrate unlock
 Only when the run is genuinely dead. Releasing it under a live run makes
 both that run's numbers and the next one's suspect.
 
+### Filing a result that was run directly on the endpoint
+
+`run` fetches and ingests automatically, but only for a measurement it
+started itself. If someone SSHes into an endpoint and runs `cpms-bench`
+by hand instead — comes up more often than you'd expect, e.g. someone
+troubleshooting a specific endpoint mid-demo — that result sits on the
+endpoint until something files it. `fetch` is that something:
+
+```bash
+sudo cpms-orchestrate fetch --from cpms-endpoint01
+```
+
+It pulls every `*.json` sitting directly in the endpoint's results
+directory (`/mnt/ramdisk/results` — a subdirectory there, e.g. from a
+prior `run`, is left alone), ingests them, then moves the endpoint's own
+copies into `.fetched/` so a second `fetch` doesn't re-ingest the same
+files. A failure at any step (fetch or ingest) leaves the endpoint
+untouched — nothing is moved until ingest actually succeeds. `--dry-run`
+and `--no-ingest` both work the same way they do for `run`.
+
 > **After sealing and cloning a controller**, its key is gone from the image
 > by design — a clone carrying the master's key could log into every
 > endpoint the master ever enrolled. Cloned *endpoints* likewise lose the
@@ -452,12 +622,12 @@ Measure the path before you trust a number from it, and silence the machine
 while you do.
 
 ```bash
-cpms-pathmtu 192.168.65.65     # true path MTU, by binary search
+cpms-pathmtu <peer-address>     # true path MTU, by binary search
 cpms-quiesce check             # what would interfere; changes nothing
 cpms-quiesce baseline          # snapshot NIC counters
 sudo cpms-quiesce run -- iperf3-cpms -c <peer> -t 60 -P 4 -O 10 -J \
      --get-server-output > /mnt/ramdisk/run.json
-perfenv --merge /mnt/ramdisk/run.json --iface ens33
+cpms-perfenv --merge /mnt/ramdisk/run.json --iface ens33
 ```
 
 `run` baselines counters, quiesces, runs the command as the invoking user,
@@ -467,15 +637,79 @@ totals; those accumulate from boot (§4.6).
 
 Two arguments carry more weight than they look:
 
-- **`perfenv --merge` is not optional.** Without it the file is a bare
+- **`cpms-perfenv --merge` is not optional.** Without it the file is a bare
   iperf3 document with no record of the kernel, NIC, MTU, ring sizes,
   congestion control or clock state it was taken under — and a throughput
   number without those is not reproducible. Merge immediately, before
-  changing any profile: `perfenv` reads the *live* system, so a fingerprint
-  taken later describes a different machine.
+  changing any profile: `cpms-perfenv` reads the *live* system, so a
+  fingerprint taken later describes a different machine.
 - **`-O 10`** omits slow-start, whose intervals sit far off the steady-state
   rate. Included, they dominate the variance. Every figure in spec §5 was
   taken with it, so a run without it is not comparable to them.
+
+### `cpms-perfenv` — what it actually captures
+
+`cpms-perfenv` (endpoint only; installed by provision stage 7,
+`/usr/local/bin/cpms-perfenv`) is a small Python script with no
+dependencies beyond the standard library and the host's own tools
+(`ethtool`, `chronyc`, `lscpu`, `sysctl`). Run bare it prints one JSON
+document to stdout; `--merge <file>` embeds that same document into an
+existing result under the top-level `cpms_env` key instead (spec §4.8
+documents the schema this JSON must satisfy — `tests/env_schema_test.sh`
+enforces it against every fixture in `results/`). Five sections, one
+function call each:
+
+| Section | What it reads | Why it matters |
+|---|---|---|
+| `host` | hostname, `/etc/os-release`, kernel, arch, `systemd-detect-virt`, CPU count/model (`lscpu`), RAM, NUMA nodes | A kernel or hypervisor difference between two hosts can explain a throughput gap that looks like a network problem |
+| `tools` | version strings for the pinned `iperf3` (`/opt/iperf3-3.21`), the distro `iperf3`, `iperf2`, `fio`, `tcpdump`, `nuttcp` | A result taken with the wrong `iperf3` build is not comparable to the pinned-build baseline in spec §5 |
+| `tcp` | `net.ipv4.tcp_congestion_control`, available CC algorithms, `default_qdisc`, `rmem_max`/`wmem_max`, `tcp_rmem`/`tcp_wmem`, `tcp_mtu_probing`, `rp_filter`, and the active `cpms-perfprofile` (from `/run/cpms-profile`, or `null` if never set — meaning baseline) | This is the tuning state a `cpms-perfprofile` switch changes; without it a fast run and a slow run on the same host are indistinguishable |
+| `nic` | name, driver, speed, MTU, MAC, IPv4, `ethtool -k` offload flags, `ethtool -g` RX/TX ring sizes, for the interface named by `--iface` (or `$CPMS_TEST_IFACE`) | Ring size and offload state are exactly the "why is this run different from that one" questions a bare throughput number cannot answer |
+| `clock` | `chronyc tracking`'s leap status, stratum, system time offset, root delay/dispersion, and a derived `synced` boolean | One-way-delay figures (`owd`, `owamp`, `twamp`) are only trustworthy when `synced` is true — see the NTP design note in CLAUDE.md |
+
+`--merge` is destructive to the *file*, not the *host*: it reads the live
+system at the moment it runs, writes the result back with `cpms_env`
+attached, and does nothing else. Nothing about it is idempotent to call
+twice with different live state — the second call overwrites the first
+fingerprint, which is exactly why it must run immediately after the
+measurement and before switching profiles, not batched up afterward.
+
+### `cpms-perfprofile` — switching the TCP tuning profile
+
+`cpms-perfprofile` (endpoint only — a controller has nothing to tune and
+skips this stage entirely, spec §10.8; installed by provision stage 4,
+`/usr/local/bin/cpms-perfprofile`) is the runtime-only counterpart to the
+sysctl baseline stage 4 also applies. It exists because there was
+originally no way back from a tuning change short of a reboot — a poor
+answer mid-measurement, and an easy one to forget, leaving a result
+attributed to conditions it was not actually taken under.
+
+```bash
+cpms-perfprofile show                    # active profile + live sysctl values
+cpms-perfprofile list                    # profile names and one-line descriptions
+sudo cpms-perfprofile <profile>          # apply one (writes /run/cpms-profile)
+sudo cpms-perfprofile baseline           # restore /etc/sysctl.d/90-cpms-baseline.conf
+```
+
+| Profile | Congestion control | qdisc | `rmem_max`/`wmem_max` | Intended for |
+|---|---|---|---|---|
+| `lan-10g` | cubic | fq | 64 MiB | Local VLAN, low RTT — the default shape spec §5's regression floor was measured under |
+| `wan-dx` | bbr | fq | 256 MiB | Direct Connect / high-BDP paths |
+| `wan-cubic` | cubic | fq | 256 MiB | WAN control run, to compare against `wan-dx` |
+| `psonar` | htcp | fq_codel | 256 MiB | Matches perfSONAR's own defaults, for cross-tool comparability |
+| `baseline` | *(restores sysctl default)* | — | — | Required before comparing against spec §5's reference figures, which were taken under baseline, not any profile |
+
+**Only `reno` and `cubic` are confirmed available on this image** (CLAUDE.md,
+host-tuning assessment) — `wan-dx` (bbr) and `psonar` (htcp) load their
+kernel module on first use (`modprobe tcp_<cc>`) and fail loudly if it is
+not there, but neither has actually been verified against a real
+high-BDP path yet. Do not treat their numbers as validated the way
+`lan-10g`'s are.
+
+**A profile is runtime state, not persisted config.** It lives in
+`/run/cpms-profile` — a tmpfs path — so it does not survive a reboot, and
+`cpms-perfenv`'s `tcp.profile` field is how a result records which one (if
+any) was active when it was taken.
 
 | Counter | Meaning | Verdict |
 |---|---|---|
@@ -503,7 +737,7 @@ the test, not a fault. Raise rings only against a non-zero OOB delta on a
 ```bash
 sudo cpms-quiesce run -- iperf3-cpms -c <peer> -u -b 2G -l 8972 --dont-fragment \
      -t 30 -J --get-server-output > /mnt/ramdisk/udp-2g.json
-perfenv --merge /mnt/ramdisk/udp-2g.json --iface ens33
+cpms-perfenv --merge /mnt/ramdisk/udp-2g.json --iface ens33
 ```
 
 - **`-l 8972`** is the correct jumbo payload (9000 − 20 IP − 8 UDP). iperf3
@@ -564,17 +798,25 @@ Every entry below was hit during real deployment, not imagined.
 | `cpms-setup --rollback` | Restore the most recent netplan backup |
 | `cpms-setup --reset` | Discard staged edits, re-read the live system |
 | `cpms-setup --gen-netplan` | Print the netplan that would be generated |
-| `cpms-provision --role <r>` | Run all ten stages for a role; idempotent |
+| `cpms-provision --role <r>` | Run all eleven stages for a role; idempotent |
 | `cpms-provision --stage N` | Run one stage |
 | `cpms-provision --list` | List the stages |
 | `cpms-provision --dry-run` | Show what would happen |
+| `cpms-provision --build-mcp-venv` | Cache `/opt/cpms-mcp` only — no role resolution, no controller-only side effects (§"Build the Master" above) |
+| `cpms-provision --stage-datastore-images` | Pull+build every datastore image — for an air-gapped controller, run this once on the master before sealing (§"Build the Master" above) |
 | `cpms-toolset list` | Tool groups and their install state |
 | `cpms-toolset install` | Install every diagnostic tool group (the default) |
 | `cpms-quiesce check` | Report what would interfere; changes nothing |
 | `cpms-quiesce run -- <cmd>` | Baseline, quiesce, run, restore, report counter deltas |
 | `cpms-pathmtu <target>` | True path MTU by binary search, DF set on every probe |
-| `perfprofile show` | Current congestion control and buffer profile |
-| `perfenv --iface <if>` | Environment fingerprint as JSON — embed it in every result |
+| `cpms-perfprofile show` | Current profile + live sysctl values (§06) |
+| `cpms-perfprofile list` | Profile names and one-line descriptions (built-in help) |
+| `sudo cpms-perfprofile lan-10g` | cubic + fq, 64 MiB buffers — local VLAN, low RTT; the default shape spec §5's regression floor was measured under |
+| `sudo cpms-perfprofile wan-dx` | bbr + fq, 256 MiB buffers — Direct Connect / high-BDP paths; **unverified on this image**, only reno/cubic are confirmed available |
+| `sudo cpms-perfprofile wan-cubic` | cubic + fq, 256 MiB buffers — WAN control run, to compare against `wan-dx` on the same path |
+| `sudo cpms-perfprofile psonar` | htcp + fq_codel, 256 MiB buffers — matches perfSONAR's own defaults, for cross-tool comparability; **unverified on this image** |
+| `sudo cpms-perfprofile baseline` | Restore `/etc/sysctl.d/90-cpms-baseline.conf`, clear `/run/cpms-profile` — required before comparing a result against spec §5's reference figures, which were taken under baseline, not any profile |
+| `cpms-perfenv --iface <if>` | Environment fingerprint as JSON (§06) — `--merge <file>` embeds it in a result |
 | `cpms-seal --dry-run` | Print the exact seal manifest, change nothing |
 | `cpms-seal` | Strip identity and power off. No undo. |
 
@@ -595,11 +837,12 @@ Every entry below was hit during real deployment, not imagined.
 | `cpms-datastore init` / `up` / `status` | Postgres + Grafana lifecycle |
 | `cpms-ingest --dry-run <file>` | Parse a result, load nothing |
 | `cpms-ingest <file>` | Load a result into the archive |
-| `cpms-orchestrate keygen` | Create the controller's SSH key. Once. |
-| `cpms-orchestrate enroll <host>` | Push the key, verify, register |
+| `cpms-orchestrate keygen` | Create the controller's SSH key — already run by `cpms-provision --role controller`; safe to re-run by hand, no-ops if one exists |
+| `cpms-orchestrate enroll <host> [<host>...]` | Push the key, verify, register — one host or several in one call |
 | `cpms-orchestrate hosts` | The registry — who is enrolled, and as what |
 | `cpms-orchestrate check [host]` | Reachable, and carrying its toolchain? |
 | `cpms-orchestrate run --source <h> --target <t>` | Run on an endpoint, fetch, ingest |
+| `cpms-orchestrate fetch --from <h>` | Ingest a result already sitting on an endpoint from a manual `cpms-bench` run |
 | `cpms-orchestrate unlock` | Release a lock left by a dead run |
 
 ### Files worth knowing
@@ -620,144 +863,43 @@ Every entry below was hit during real deployment, not imagined.
 
 ---
 
-## 09 · Ask the archive in plain language (controller)
+## 09 · MCP — Connecting LLM Tools to CPMS (controller)
 
-Optional. An MCP server that lets an LLM client query the archive, explain a
-verdict, and start a run. **No Node, no `npx` running on the controller
-host directly** — this is Python in a venv. A client that needs `npx` to
-reach it (below) runs that on the client machine, not here. (The Web UI's
-frontend, §09b, does use Node — but only inside an ephemeral Docker build
-stage that never touches the controller's own OS; §1's "minimal host
-package set" intent survives, it just no longer means "no Node exists
-anywhere in this project.")
+Optional. An MCP server exposes the archive to any LLM client — ask
+questions in plain language, explain a verdict, or kick off a
+`cpms_run_benchmark`. Built and started as part of controller
+provisioning (stage 9); nothing more to do on the controller unless a
+client needs wiring. For the transport rationale, troubleshooting, and
+the full 14-tool reference, see [MCP-CLIENTS.md](MCP-CLIENTS.md) — this
+section is just enough to connect the two supported client shapes.
+
+If stage 9 hasn't run yet (a master built with only
+`cpms-provision --build-mcp-venv`, §"Build the Master" above):
 
 ```bash
-sudo apt-get install -y python3-venv
-sudo python3 -m venv /opt/cpms-mcp
-sudo /opt/cpms-mcp/bin/pip install mcp psycopg2-binary
-sudo install -m 0755 cpms_mcp.py /usr/local/bin/cpms_mcp.py
 sudo cpms-provision --stage 9
 ```
 
-That last line matters. The server reads `/etc/cpms/datastore.env`, which is
-mode 0600, and an MCP client launches it over a **stdio pipe with no TTY** —
-a sudo password prompt there cannot be answered and the client reports it as
-the server crashing. Stage 9 installs `/etc/sudoers.d/cpms-controller`
-granting `perfadmin` that one exact command line. The alternative was putting
-the archive password into the client's config file, which moves a
-root-equivalent credential onto a laptop in plaintext.
+### Get your auth token
 
-Prove it before wiring any client — this exercises the import, the venv, the
-credentials read and the SQL in one line:
-
-```bash
-sudo /opt/cpms-mcp/bin/python -c "import sys; sys.path.insert(0,'/usr/local/bin'); import cpms_mcp; print(cpms_mcp._query('SELECT count(*) AS runs FROM cpms_run'))"
-```
-
-Expect a row count. Everything except the transport is then confirmed.
-
-### Connecting a client
-
-The command is always the same; only the wrapper changes with where the
-client runs.
-
-| Client runs | Launch command |
-|---|---|
-| On the controller | `sudo /opt/cpms-mcp/bin/python /usr/local/bin/cpms_mcp.py` |
-| Anywhere else | `ssh perfadmin@<controller> sudo /opt/cpms-mcp/bin/python /usr/local/bin/cpms_mcp.py` |
-
-**Claude Code:**
-
-```bash
-claude mcp add cpms -- sudo /opt/cpms-mcp/bin/python /usr/local/bin/cpms_mcp.py
-```
-
-**LM Studio** (and anything else using the Claude Desktop config shape) — add
-to its `mcp.json`, which LM Studio edits from its integrations panel:
-
-```json
-{
-  "mcpServers": {
-    "cpms": {
-      "command": "ssh",
-      "args": [
-        "perfadmin@192.168.65.250",
-        "sudo", "/opt/cpms-mcp/bin/python", "/usr/local/bin/cpms_mcp.py"
-      ]
-    }
-  }
-}
-```
-
-The MCP pipe has no TTY, so **anything ssh wants to ask is fatal** — a
-password prompt, or the first-connection host-key question. Both make the
-server appear to crash instantly with no error, because ssh dies before
-Python ever starts. Two things must be true on the client machine first.
-
-**1. The controller's host key must already be trusted.** Connect once by
-hand and answer `yes`:
-
-```
-ssh perfadmin@<controller> true
-```
-
-**2. Key-based login must work without a password.** On Windows there is no
-`ssh-copy-id` — OpenSSH for Windows does not ship it — so append the key
-yourself:
-
-```
-ssh-keygen -t ed25519
-type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh perfadmin@<controller> "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-```
-
-(that `type` line is PowerShell; from Git Bash use `cat ~/.ssh/id_ed25519.pub | ssh ...`)
-
-Then verify it is truly non-interactive — this must print `ok` with no
-prompt of any kind:
-
-```
-ssh -o BatchMode=yes perfadmin@<controller> echo ok
-```
-
-`BatchMode=yes` makes ssh fail instead of prompting, which is exactly the
-condition the MCP pipe runs under. If that command works, the transport
-will too.
-
-### If the client says the server disconnected immediately
-
-A start-then-close inside a few hundred milliseconds, with no stderr in the
-log, means the failure happened before Python ran. Test the pipe end to end
-by hand — this sends a real MCP handshake:
-
-```
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' | ssh -o BatchMode=yes perfadmin@<controller> sudo /opt/cpms-mcp/bin/python /usr/local/bin/cpms_mcp.py
-```
-
-A JSON reply naming `cpms_mcp` means the whole chain works and the problem
-is in the client's config. Anything else — a password prompt, `Host key
-verification failed`, `sudo: a terminal is required` — names the step to fix
-and none of them are the server.
-
-### Claude Desktop on Windows: use the network transport, not ssh
-
-Claude Desktop spawns MCP servers from its bundled Node with no console
-attached (Electron's `windowsHide`). Win32-OpenSSH's `ssh.exe` crashes in
-that environment — exit 255, zero output, in well under 100ms, before it
-opens a connection. This is not fixable from the client config; every
-variant of the `ssh` launch above will hit it. Use the `streamable-http`
-transport instead, which is exactly what the other Node-based MCP servers
-in a Claude Desktop config already use.
-
-Stage 9 (`sudo cpms-provision --stage 9`) starts `cpms-mcp.service`
-automatically once the venv exists, listening on `:8765`, with a bearer
-token generated into `/etc/cpms/mcp.env`:
+Generated once by stage 9 into `/etc/cpms/mcp.env`, and never regenerated
+by a later `cpms-provision` run — set this once per client, not once per
+provision:
 
 ```bash
 sudo cat /etc/cpms/mcp.env
 # CPMS_MCP_TOKEN=...
 ```
 
-Add to `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\`):
+### LM Studio and Claude Desktop — identical config
+
+Both are Electron/Node apps and both need `npx` on the *client* machine,
+not the controller — and both must use the network transport
+(`streamable-http`), not SSH: see
+[MCP-CLIENTS.md](MCP-CLIENTS.md#why-lm-studio-and-claude-desktop-cant-use-the-ssh-transport-at-all)
+for why. Paste the same block into LM Studio's `mcp.json` (its
+integrations panel edits this) and into `claude_desktop_config.json`
+(Windows: `%APPDATA%\Claude\`):
 
 ```json
 {
@@ -779,48 +921,30 @@ Add to `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\`):
 }
 ```
 
-Fully quit and relaunch Claude Desktop after editing the config — it only
-reads it at startup. Confirm it worked by asking Claude to call
-`cpms_archive_status`; a schema-version table back means the whole chain
-is live.
+Fully quit and relaunch the client after editing — both only read config
+at startup. Confirm it worked by asking it to call `cpms_archive_status`;
+a schema-version table back means the whole chain is live.
 
-The token is generated once and never regenerated by a re-provision, so
-editing the config again is not needed after every `cpms-provision` run.
-Without `CPMS_MCP_TOKEN` set, the server refuses to bind to anything but
-loopback — `cpms_run_benchmark` is not read-only, and an unauthenticated
-listener on the management VLAN is a worse trust boundary than the SSH
-pubkey auth the stdio path relies on.
+### Claude Code — SSH stdio, no token needed
 
-### The tools
+```bash
+claude mcp add cpms -- sudo /opt/cpms-mcp/bin/python /usr/local/bin/cpms_mcp.py
+```
 
-Nine read, two write. Grew from nine total (eight read, one write) building
-the Web UI (§09b) — `cpms_list_catalog`/`cpms_set_task_enabled` were added
-2026-09-02 so the catalog/scheduler had the same tool-surface access as
-everything else.
+Run that on the controller itself, or wrap it in `ssh` to add it from
+anywhere else:
 
-| Tool | |
-|---|---|
-| `cpms_archive_status` | Schema version, run counts, data-quality problems |
-| `cpms_list_runs` | Filterable, paginated; each row carries its conditions |
-| `cpms_get_run` | One run in full, with its fingerprint |
-| `cpms_compare_runs` | Side by side **and whether they are comparable at all** |
-| `cpms_explain_verdict` | Walks §10.6 and shows which condition matched |
-| `cpms_check_regression` | Against the §5 floor, reporting MTU alongside |
-| `cpms_list_hosts` | Who may be a measurement source |
-| `cpms_list_catalog` | The §10.4 catalog's tasks, joined against live schedule state |
-| `cpms_plan_benchmark` | Plain-language goal → the right matrix, with reasoning |
-| `cpms_run_benchmark` | **Not read-only.** Takes the lock, saturates a link. |
-| `cpms_set_task_enabled` | **Not read-only.** Enables/pauses a scheduled task — never starts a benchmark itself |
+```bash
+ssh perfadmin@<controller> sudo /opt/cpms-mcp/bin/python /usr/local/bin/cpms_mcp.py
+```
 
-Start with `cpms_archive_status`. If it answers, the wiring is right.
+This needs the controller's host key already trusted and passwordless
+key login working first — [MCP-CLIENTS.md](MCP-CLIENTS.md#ssh-prerequisites-for-the-claude-code-stdio-path)
+has the two commands to confirm that before wiring the client.
 
-`cpms_compare_runs` is the one worth having. An LLM handed raw SQL rows will
-happily attribute a throughput difference to the network when the two runs
-had different MTU, congestion control, kernel, tool version or NIC ring
-sizes. It refuses to let that pass silently, and flags runs whose CV puts
-the mean beyond trust (§9) or whose NIC counters invalidate them (§4.6).
-
-Leave `cpms_run_benchmark` until the read tools work.
+Something not connecting? [MCP-CLIENTS.md](MCP-CLIENTS.md) has a
+raw-handshake test for both transports and the full tool reference —
+start with `cpms_archive_status`; if it answers, the wiring is right.
 
 ---
 
@@ -879,10 +1003,10 @@ not just the control port.
 | 5000 | tcp | `nuttcp` control | `nuttcp` matrix |
 | ~5101 | tcp | `nuttcp` data | Dynamically negotiated over the control channel — confirmed on the real binary, not `-p`'s documented default; don't assume this stays fixed across nuttcp versions |
 | 443 | tcp | TLS echo listener | `idle` matrix (configurable via `--port`, default 443) |
-| 861 | tcp | OWAMP-Control | Experimental (CLAUDE.md, 2026-09-02) — not installed by `cpms-provision` yet, built from source and verified live cross-host |
-| 8760–9960 | udp | OWAMP test traffic | Per-session range from the sample `owamp-server.conf`, negotiated over 861/tcp |
-| 862 | tcp | TWAMP-Control | Same experimental status as OWAMP above — confirmed live, `twampd` |
-| 18760–19960 | udp | TWAMP test traffic | Per-session range from the sample `twamp-server.conf`, negotiated over 862/tcp |
+| 861 | tcp | OWAMP-Control | `owamp`/`twamp` matrices — stage 10 builds and starts this (`cpms-owamp.service`), real one-way delay, not the `owd` matrix's iperf2 approximation |
+| 8760–9960 | udp | OWAMP test traffic | Per-session range from `owamp-server.conf`, negotiated over 861/tcp |
+| 862 | tcp | TWAMP-Control | Same as OWAMP above — `cpms-twamp.service` |
+| 18760–19960 | udp | TWAMP test traffic | Per-session range from `twamp-server.conf`, negotiated over 862/tcp |
 
 **Controller role**
 
