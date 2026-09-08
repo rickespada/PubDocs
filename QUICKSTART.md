@@ -1000,7 +1000,7 @@ must be open, not just the control port.
 | 5001 | tcp | Source: endpoint → Destination: endpoint | `iperf2` (TCP) | `owd` matrix (`cpms-iperf2-client`) |
 | 5001 | udp | Source: endpoint → Destination: endpoint | `iperf2` (UDP) | `iso` matrix |
 | 5000 | tcp | Source: endpoint → Destination: endpoint | `nuttcp` control | `nuttcp` matrix |
-| ~5101 | tcp | Source: endpoint → Destination: endpoint | `nuttcp` data | Dynamically negotiated over the control channel. Do not assume this port stays fixed across nuttcp versions. |
+| 5101 | tcp | Source: endpoint → Destination: endpoint | `nuttcp` data | Dynamically negotiated over the control channel. Do not assume this port stays fixed across nuttcp versions. |
 | 8443 | tcp | Source: endpoint → Destination: endpoint | TLS echo listener | `idle` matrix (port configurable via `--port`, default 8443) |
 | 443 | tcp | Source: browser → Destination: endpoint | `ndt7-server` (TLS) | NDT7 browser speed test. The browser connects to this endpoint directly, not through the controller. Self-signed certificate; expect a one-time browser trust warning per endpoint. |
 | 80 | tcp | Source: browser → Destination: endpoint | `ndt7-server` (cleartext) | NDT7 Speed Test page uses `ws://` on this port. The browser connects directly to the endpoint. Not proxied through nginx. |
