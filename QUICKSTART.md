@@ -199,7 +199,7 @@ when it provisions for its own role.
 | 6 | Measurement listeners | Enabled (iperf3, iperf2, nuttcp) | Disabled |
 | 7 | cpms-perfenv fingerprint | Yes | Yes |
 | 8 | First-boot setup service | Yes | Yes |
-| 9 | Orchestration hookup | Installs `/etc/sudoers.d/cpms-endpoint`: `perfadmin` may run `cpms-bench`, `cpms-quiesce`, and `cpms-perfenv` as root without a password. Nothing else. | Creates `/etc/cpms/` and `/var/lib/cpms/incoming`. Installs `/etc/sudoers.d/cpms-controller` (MCP token reader rule). Disables `cpms-ndt7.service` if present (convergence from endpoint role). Runs `ensure_mcp_token`. Runs `ensure_prometheus_targets`. Calls `cpms-datastore init` via `bootstrap_datastore`. Installs and enables `cpms-mcp.service`. Runs `cpms-orchestrate keygen`. Installs `cpms-ndt7-fetch.timer`. |
+| 9 | Orchestration hookup | Installs `/etc/sudoers.d/cpms-endpoint`: `perfadmin` may run `cpms-bench`, `cpms-quiesce`, `cpms-perfenv`, and `cpms-perfprofile` as root without a password. Nothing else. | Creates `/etc/cpms/` and `/var/lib/cpms/incoming`. Installs `/etc/sudoers.d/cpms-controller` (MCP token reader rule). Disables `cpms-ndt7.service` if present (convergence from endpoint role). Runs `ensure_mcp_token`. Runs `ensure_prometheus_targets`. Calls `cpms-datastore init` via `bootstrap_datastore`. Installs and enables `cpms-mcp.service`. Runs `cpms-orchestrate keygen`. Installs `cpms-ndt7-fetch.timer`. |
 | 10 | OWAMP/TWAMP source build | Enabled (ports 861 and 862) | Disabled |
 | 11 | NDT7 source build | Enabled (ports 443 and 80) | Disabled |
 | 12 | Observability (node_exporter) | Yes | Yes |
@@ -674,6 +674,23 @@ sudo cpms-perfprofile <profile>          # apply a profile (writes /run/cpms-pro
 sudo cpms-perfprofile baseline           # restore /etc/sysctl.d/90-cpms-baseline.conf
 ```
 
+From the controller, without an interactive login to the endpoint:
+
+```bash
+sudo cpms-orchestrate perfprofile --source <endpoint> show
+sudo cpms-orchestrate perfprofile --source <endpoint> lan-10g
+```
+
+`show` and `list` need no privilege on the endpoint and take no lock.
+Applying a profile briefly holds the global lock (section 03c) — a profile
+change affects a concurrent run's numbers — then runs `sudo -n
+cpms-perfprofile <profile>` on the endpoint over SSH.
+
+The Web UI's Run page (section 07b, below) offers the same read/switch as a
+control next to any matrix a profile actually affects. That control is a thin
+wrapper over the MCP server's `cpms_set_perfprofile` tool (section 07). That
+tool itself calls `cpms-orchestrate perfprofile`.
+
 | Profile | Congestion control | qdisc | `rmem_max`/`wmem_max` | Intended for |
 |---|---|---|---|---|
 | `lan-10g` | cubic | fq | 64 MiB | Local VLAN, low RTT — the shape the spec's regression floor was measured under |
@@ -821,6 +838,8 @@ Every entry below occurred during real deployment.
 | `cpms-orchestrate hosts` | The registry — who is enrolled, and as what |
 | `cpms-orchestrate check [host]` | Is the host reachable and does it carry its toolchain? |
 | `cpms-orchestrate run --source <h> --target <t>` | Run a measurement on an endpoint, fetch the result, and ingest it |
+| `cpms-orchestrate perfprofile --source <h> show` \| `list` | Read the endpoint's active `cpms-perfprofile` over SSH. No lock, no privilege needed on the endpoint. |
+| `cpms-orchestrate perfprofile --source <h> <profile>` | Apply a profile on the endpoint over SSH. Holds the global lock briefly — a profile change affects a concurrent run's numbers. |
 | `cpms-orchestrate fetch --from <h>` | Ingest a result already on an endpoint from a manual `cpms-bench` run |
 | `cpms-orchestrate ndt7-fetch --from <h>` | Fetch browser NDT7 results from one endpoint's data directory and ingest them |
 | `cpms-orchestrate ndt7-fetch --all` | Same fetch for every enrolled endpoint in one call |
@@ -839,7 +858,7 @@ Every entry below occurred during real deployment.
 | `/var/log/cpms-provision.log` | Full provisioning detail |
 | `/etc/cpms/id_cpms` | Controller's SSH key, root-only. Removed by sealing. |
 | `/etc/cpms/known_hosts` | Host keys learned at enrollment. A changed key fails the connection. |
-| `/etc/sudoers.d/cpms-endpoint` | Endpoint: NOPASSWD on three measurement commands, nothing else |
+| `/etc/sudoers.d/cpms-endpoint` | Endpoint: NOPASSWD on four measurement commands, nothing else |
 | `/var/lib/cpms/incoming/<ts>/` | Controller: results fetched from endpoints |
 
 ---
@@ -850,8 +869,10 @@ Optional. An MCP server exposes the archive to any LLM (Large Language Model)
 client. Ask questions in plain language, explain a verdict, or start a
 `cpms_run_benchmark`. The MCP server is built and started as part of controller
 provisioning (stage 9). No further action is needed on the controller unless a
-client needs wiring. For the transport rationale, troubleshooting, and the full
-tool reference, see MCP-CLIENTS.md.
+client needs wiring. The transport rationale, deeper troubleshooting, and the
+full tool reference live in this project's internal engineering
+documentation, which is not part of this public guide. This section covers
+the steps needed to connect a client.
 
 If stage 9 has not run yet (a master built with only
 `cpms-provision --build-mcp-venv`):
@@ -873,8 +894,9 @@ sudo cat /etc/cpms/mcp.env
 ### LM Studio and Claude Desktop — Identical Configuration
 
 Both apps need `npx` on the **client machine**, not the controller. Both must
-use the network transport (`streamable-http`). See MCP-CLIENTS.md for the
-reasons. Paste the same block into LM Studio's `mcp.json` (its integrations
+use the network transport (`streamable-http`). Neither app can use the SSH
+transport described below for Claude Code. Paste the same block into LM
+Studio's `mcp.json` (its integrations
 panel edits this file) and into `claude_desktop_config.json` (Windows:
 `%APPDATA%\Claude\`):
 
@@ -918,12 +940,14 @@ ssh perfadmin@<controller-address> sudo /opt/cpms-mcp/bin/python /usr/local/bin/
 ```
 
 This requires the controller's SSH host key to be already trusted and
-passwordless key login to be working. See MCP-CLIENTS.md for the two commands
-to confirm that before wiring the client.
+passwordless key login to be working. Confirm both with a plain `ssh
+perfadmin@<controller-address>` login — it must succeed with no host-key
+prompt and no password prompt before you wire the client.
 
-If something is not connecting, see MCP-CLIENTS.md. It has a raw handshake
-test for both transports and the full tool reference. Start with
-`cpms_archive_status`. If it responds, the wiring is correct.
+If something is not connecting, start with `cpms_archive_status`. If it
+responds, the wiring is correct. If it does not, re-check the token (network
+transport) or the SSH path (stdio transport) independently before assuming
+the server itself is at fault.
 
 ---
 
@@ -945,13 +969,13 @@ Reach the Web UI at `http://<controller-address>:8090`.
 
 The Web UI has **six pages** — Hosts, Catalog, Run, History, Compare, and
 Speed Test — plus a **Chat tab**. Each page is a view over the same
-`cpms_mcp` tools described in section 09.
+`cpms_mcp` tools described in section 07.
 
 | Page | What it does |
 |---|---|
 | **Hosts** | Shows the enrolled host registry. Includes a direct link to each endpoint's NDT7 browser speed test (connects to that endpoint's port 443 directly from your browser). |
 | **Catalog** | Lists scheduled tasks. Toggle a task on or off. |
-| **Run** | Submit a one-off measurement from the browser. |
+| **Run** | Submit a one-off measurement from the browser. For matrices where TCP tuning affects the result (`quick`, `baseline`, `scaling`, `udp-ramp`, `nuttcp`), the page also shows a "TCP profile" control and an "Apply to" control. "Apply to" defaults to both endpoints when Source and Target are both enrolled endpoints, because buffer sizing affects both ends of a path. Change "Apply to" to target one endpoint instead. "Apply profile" and "Show current" call the same profile switch as the CLI (see "cpms-perfprofile — Switching the TCP Tuning Profile", section 04, above). |
 | **History** | Shows past results with headline metrics. Select a Run ID to download the raw result JSON. |
 | **Compare** | Compare two runs side by side. |
 | **Speed Test** | Runs an NDT7 test directly from your browser to a selected endpoint. The page sets `protocol: 'ws'` with no explicit port; port 80 is the `ws://` protocol default. The test connects directly to the endpoint — not proxied through the Web UI's nginx. NDT7 derives its throughput and RTT numbers from the kernel's TCP_INFO on the measurement socket. Routing that socket through a proxy would create two separate TCP sessions and invalidate the numbers. |
